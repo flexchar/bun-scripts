@@ -92,6 +92,28 @@ const filteredRecords = initialRecords
                 );
             }
 
+            // Validate that B-type records always have negative amount
+            // Aka, one cannot sell services/goods without earning money
+            if (p.type.startsWith('B')) {
+                if (p.baseValue >= 0) {
+                    throw new Error(
+                        `Invalid baseValue ${p.baseValue} for invoice ${String(
+                            p.invoiceId,
+                        )}: B-type records must have negative amount`,
+                    );
+                }
+            }
+            // Then perform the same for A-type records
+            if (p.type.startsWith('A')) {
+                if (p.baseValue <= 0) {
+                    throw new Error(
+                        `Invalid baseValue ${p.baseValue} for invoice ${String(
+                            p.invoiceId,
+                        )}: A-type records must have positive amount`,
+                    );
+                }
+            }
+
             // Attach derived flags without changing the rest of the pipeline
             return {
                 ...p,
