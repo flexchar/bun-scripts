@@ -29,8 +29,8 @@ type InitialRecord = {
     date: string;
     name: string;
     type: 'A - Services' | 'A - Goods' | 'B - Services';
-    // Removed inEu/inDk columns; now we infer from VAT number
-    vatNumber?: string | null;
+    inEu: 0 | 1;
+    inDk: 0 | 1;
     grandTotal: number;
     vatRate: number;
     baseValue: number;
@@ -44,19 +44,23 @@ const recSchema = z.object({
     date: z.string().transform((d) => new Date(d)),
     name: z.string(),
     type: z.enum(['A - Services', 'A - Goods', 'B - Services']),
-    // Optional VAT number; when present we treat as EU
-    vatNumber: z
-        .string()
-        .transform((s) => s?.toString?.() ?? '')
-        .optional(),
+    inEu: z
+        .number()
+        .min(0)
+        .max(1)
+        .transform((v) => Boolean(v)),
+    inDk: z
+        .number()
+        .min(0)
+        .max(1)
+        .transform((v) => Boolean(v)),
     grandTotal: z.number(),
     vatRate: z.number(),
     baseValue: z.number(),
     vatValue: z.number(),
 });
 
-// Extend with derived flags so downstream filters keep working unchanged
-type Record = z.infer<typeof recSchema> & { inEu: boolean; inDk: boolean };
+type Record = z.infer<typeof recSchema>;
 
 const filteredRecords = initialRecords
     // Filter records for the period defined in .env
@@ -67,42 +71,9 @@ const filteredRecords = initialRecords
     .map((r: InitialRecord) => {
         try {
             const p = recSchema.parse(r);
-
-            // Derived helpers
-            const rawVat = (p.vatNumber ?? '').toString();
-            const normalizedVat = rawVat.replace(/\s|-/g, '').toUpperCase();
-            const isDk = normalizedVat.startsWith('DK');
-            const hasVat = normalizedVat.length > 0;
-
-            // Validations from notes:
-            // - VAT rate is a multiplier, never higher than 1
-            if (p.vatRate > 1) {
-                throw new Error(
-                    `Invalid vatRate ${p.vatRate} for invoice ${String(
-                        p.invoiceId,
-                    )}: vatRate must be a multiplier (<= 1)`,
-                );
-            }
-            // - If DK VAT number, assert rate is 0.25
-            if (isDk && p.vatRate !== 0.25) {
-                throw new Error(
-                    `Invalid vatRate ${p.vatRate} for invoice ${String(
-                        p.invoiceId,
-                    )}: DK transactions must have 0.25 VAT rate`,
-                );
-            }
-
-            // Attach derived flags without changing the rest of the pipeline
-            return {
-                ...p,
-                // emulate former fields via derived flags
-                inEu: hasVat,
-                inDk: isDk,
-            } as Record;
+            return p;
         } catch (e) {
-            const err: any = e;
-            if (err?.errors) console.error(err.errors);
-            else console.error(err);
+            console.error(e.errors);
             console.error(r);
             process.exit(1);
         }
@@ -292,7 +263,7 @@ Under ’EU-salg uden moms’ (EU sales exclusive of VAT) by the 25th day of eac
     );
 
 // Round to no decimal places
-(Object.keys(tax) as Array<keyof typeof tax>).forEach((key) => {
+Object.keys(tax).forEach((key) => {
     tax[key] = Math.round(tax[key]);
 });
 
@@ -311,7 +282,6 @@ const dansk = {
     'Rubrik A - varer': tax['box-a-goods'],
     'Rubrik A - ydelser': tax['box-a-services'],
     'Rubrik B - ydelser': tax['box-b-services'],
-    'Rubrik B - varer': tax['box-b-goods'],
     'Rubrik C': tax['box-c-services'],
     'EU-salg med moms': tax['eu-sales-with-vat'],
     'EU-salg uden moms': tax['eu-sales-without-vat'],
@@ -332,7 +302,6 @@ const english = {
     'Box A - goods': tax['box-a-goods'],
     'Box A - services': tax['box-a-services'],
     'Box B - services': tax['box-b-services'],
-    'Box B - goods': tax['box-b-goods'],
     'Box C': tax['box-c-services'],
     'EU sales with VAT': tax['eu-sales-with-vat'],
     'EU sales exclusive of VAT': tax['eu-sales-without-vat'],
