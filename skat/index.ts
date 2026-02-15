@@ -28,7 +28,7 @@ type InitialRecord = {
     invoiceId: string;
     date: string;
     name: string;
-    type: 'A - Services' | 'A - Goods' | 'B - Services';
+    type: 'A - Services' | 'A - Goods' | 'B - Services' | 'B - Goods';
     // Removed inEu/inDk columns; now we infer from VAT number
     grandTotal: number;
     vatRate: number;
@@ -43,7 +43,7 @@ const recSchema = z.object({
     invoiceId: z.any(),
     date: z.string().transform((d) => new Date(d)),
     name: z.string(),
-    type: z.enum(['A - Services', 'A - Goods', 'B - Services']),
+    type: z.enum(['A - Services', 'A - Goods', 'B - Services', 'B - Goods']),
     // Optional VAT number; when present we treat as EU
     grandTotal: z.number(),
     vatRate: z.number(),
@@ -91,6 +91,14 @@ const filteredRecords = initialRecords
                     )}: DK transactions must have 0.25 VAT rate`,
                 );
             }
+            // - Ensure base + VAT equals grand total (within rounding tolerance)
+            if (Math.abs(p.baseValue + p.vatValue - p.grandTotal) > 0.01) {
+                throw new Error(
+                    `Invalid totals for invoice ${String(
+                        p.invoiceId,
+                    )}: baseValue + vatValue must equal grandTotal`,
+                );
+            }
 
             // Validate that B-type records always have negative amount
             // Aka, one cannot sell services/goods without earning money
@@ -103,6 +111,14 @@ const filteredRecords = initialRecords
                     );
                 }
             }
+            // This workflow only supports service sales; block accidental goods sales.
+            if (p.type === 'B - Goods') {
+                throw new Error(
+                    `Invalid type ${p.type} for invoice ${String(
+                        p.invoiceId,
+                    )}: B - Goods is not supported in this workflow`,
+                );
+            }
             // Then perform the same for A-type records
             if (p.type.startsWith('A')) {
                 if (p.baseValue <= 0) {
@@ -112,6 +128,24 @@ const filteredRecords = initialRecords
                         )}: A-type records must have positive amount`,
                     );
                 }
+            }
+            // Purchases outside DK should not carry foreign VAT in this model.
+            // If VAT exists, stop and require manual handling.
+            if (!isDk && p.type.startsWith('A') && p.vatRate > 0) {
+                throw new Error(
+                    `Invalid vatRate ${p.vatRate} for invoice ${String(
+                        p.invoiceId,
+                    )}: non-DK purchases must be reviewed manually`,
+                );
+            }
+            // In this workflow all non-DK sales are B2B and should be VAT-free.
+            // VAT number can be missing for non-EU countries (e.g. US clients).
+            if (!isDk && p.type.startsWith('B') && p.vatRate !== 0) {
+                throw new Error(
+                    `Invalid vatRate ${p.vatRate} for invoice ${String(
+                        p.invoiceId,
+                    )}: non-DK B2B sales must have 0 VAT`,
+                );
             }
 
             // Attach derived flags without changing the rest of the pipeline
@@ -177,7 +211,7 @@ const tax = {
 
 tax['vat-in-dk'] = filteredRecords
     .filter((r: Record) => r.inDk)
-    .filter((r: Record) => r.type === 'A - Services' || r.type === 'A - Goods')
+    .filter((r: Record) => r.type.startsWith('A'))
     .reduce((acc: number, r: Record) => acc + r.vatValue, 0);
 
 // Moms af varekøb i udlandet (både EU og lande uden for EU)
@@ -191,7 +225,7 @@ tax['vat-on-goods-purchased-outside-denmark'] = filteredRecords
         let value = r.vatValue;
 
         if (r.vatRate === 0) {
-            value = r.grandTotal * 0.25;
+            value = r.baseValue * 0.25;
             tax['manual-25-reverse-charge'] += value;
         }
 
@@ -211,7 +245,7 @@ tax['vat-on-services-purchased-outside-denmark-inside-eu'] = filteredRecords
         let value = r.vatValue;
 
         if (r.vatRate === 0) {
-            value = r.grandTotal * 0.25;
+            value = r.baseValue * 0.25;
             tax['manual-25-reverse-charge'] += value;
         }
 
@@ -225,7 +259,7 @@ tax['vat-on-services-purchased-outside-denmark-outside-eu'] = filteredRecords
         let value = r.vatValue;
 
         if (r.vatRate === 0) {
-            value = r.grandTotal * 0.25;
+            value = r.baseValue * 0.25;
             tax['manual-25-reverse-charge'] += value;
         }
 
@@ -254,7 +288,7 @@ tax['vat-paid'] =
 tax['box-a-goods'] = filteredRecords
     .filter((r: Record) => r.inEu && !r.inDk)
     .filter((r: Record) => r.type === 'A - Goods')
-    .reduce((acc: number, r: Record) => acc + r.grandTotal, 0);
+    .reduce((acc: number, r: Record) => acc + r.baseValue, 0);
 
 // Rubrik A - ydelser. Værdien uden moms af ydelseskøb i andre EU-lande.
 // Box A - services
@@ -263,7 +297,7 @@ tax['box-a-goods'] = filteredRecords
 tax['box-a-services'] = filteredRecords
     .filter((r: Record) => r.inEu && !r.inDk)
     .filter((r: Record) => r.type === 'A - Services')
-    .reduce((acc: number, r: Record) => acc + r.grandTotal, 0);
+    .reduce((acc: number, r: Record) => acc + r.baseValue, 0);
 
 // Box B - services
 // The value of certain sales of services exclusive of VAT to other EU countries. To be reported under ‘EU-salg uden moms’ (EU sales exclusive of VAT)
@@ -272,7 +306,16 @@ tax['box-a-services'] = filteredRecords
 tax['box-b-services'] = filteredRecords
     .filter((r: Record) => r.inEu && !r.inDk)
     .filter((r: Record) => r.type === 'B - Services')
-    .reduce((acc: number, r: Record) => acc + r.grandTotal, 0);
+    .filter((r: Record) => r.vatRate === 0)
+    .reduce((acc: number, r: Record) => acc + Math.abs(r.baseValue), 0);
+
+// Box B - goods
+// The value of sales of goods exclusive of VAT to other EU countries.
+tax['box-b-goods'] = filteredRecords
+    .filter((r: Record) => r.inEu && !r.inDk)
+    .filter((r: Record) => r.type === 'B - Goods')
+    .filter((r: Record) => r.vatRate === 0)
+    .reduce((acc: number, r: Record) => acc + Math.abs(r.baseValue), 0);
 
 // Box C - services/goods
 // The value of other goods and services sold exclusive of VAT in Denmark, other EU countries and countries outside the EU, see section 76 of the Executive Order
@@ -280,27 +323,34 @@ tax['box-b-services'] = filteredRecords
 // KISS: bascically my sales anywhere that don't have VAT attached, typically B2B
 tax['box-c-services'] = filteredRecords
     .filter((r: Record) => r.vatRate === 0)
-    .filter((r: Record) => r.type === 'B - Services') // i don't sell goods so only services
-    .reduce((acc: number, r: Record) => acc + r.baseValue, 0);
-// Since sales are registered as negative numbers in my expenses sheet, we need to make them positive
-tax['box-c-services'] = Math.abs(tax['box-c-services']);
+    .filter((r: Record) => r.type.startsWith('B'))
+    // Box C should only include "other" VAT-exempt sales,
+    // not the EU sales that already belong in Box B.
+    .filter((r: Record) => !(r.inEu && !r.inDk))
+    .reduce((acc: number, r: Record) => acc + Math.abs(r.baseValue), 0);
 
 // EU sales with VAT
 // The value of certain sales of goods and services exclusive of VAT to other EU countries. To be reported under ‘EU-salg med moms’ (EU sales with VAT)
 // KISS: Sales of goods and services to the EU where I charged VAT (typically B2C)
 tax['eu-sales-with-vat'] = filteredRecords
     .filter((r: Record) => r.inEu && !r.inDk)
-    .filter((r: Record) => r.type === 'B - Services')
+    .filter((r: Record) => r.type.startsWith('B'))
     .filter((r: Record) => r.vatRate > 0)
-    .reduce((acc: number, r: Record) => acc + r.grandTotal, 0);
+    .reduce((acc: number, r: Record) => acc + Math.abs(r.baseValue), 0);
 
 // EU sales without VAT
 // The value of certain sales of goods and services exclusive of VAT to other EU countries. To be reported under ‘EU-salg uden moms’ (EU sales exclusive of VAT)
 tax['eu-sales-without-vat'] = filteredRecords
     .filter((r: Record) => r.inEu && !r.inDk)
-    .filter((r: Record) => r.type === 'B - Services')
+    .filter((r: Record) => r.type.startsWith('B'))
     .filter((r: Record) => r.vatRate === 0)
-    .reduce((acc: number, r: Record) => acc + r.baseValue, 0);
+    .reduce((acc: number, r: Record) => acc + Math.abs(r.baseValue), 0);
+
+// Salgsmoms // Output VAT (VAT payable)
+tax['vat-collected'] = filteredRecords
+    .filter((r: Record) => r.type.startsWith('B'))
+    .filter((r: Record) => r.vatRate === 0.25)
+    .reduce((acc: number, r: Record) => acc + Math.abs(r.vatValue), 0);
 
 tax['eu-sales-without-vat'] &&
     console.log(
