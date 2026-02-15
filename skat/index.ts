@@ -71,7 +71,11 @@ const filteredRecords = initialRecords
             // Derived helpers
             const rawVat = (p.vatNumber ?? '').toString();
             const normalizedVat = rawVat.replace(/\s|-/g, '').toUpperCase();
-            const isDk = normalizedVat.startsWith('DK');
+            const hasDkVatOnPurchase =
+                p.type.startsWith('A') && p.vatRate === 0.25 && p.vatValue > 0;
+            // Some intermediaries (for example App Store) can invoice with non-DK VAT id
+            // while still charging DK VAT; treat those purchases as DK VAT purchases.
+            const isDk = normalizedVat.startsWith('DK') || hasDkVatOnPurchase;
             const hasVat = normalizedVat.length > 0;
 
             // Validations from notes:
