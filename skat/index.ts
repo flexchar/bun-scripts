@@ -30,11 +30,11 @@ type InitialRecord = {
     name: string;
     type: 'A - Services' | 'A - Goods' | 'B - Services';
     // Removed inEu/inDk columns; now we infer from VAT number
-    vatNumber?: string | null;
     grandTotal: number;
     vatRate: number;
     baseValue: number;
     vatValue: number;
+    vatNumber?: string | null;
 };
 
 // Verify types using zod
@@ -45,14 +45,14 @@ const recSchema = z.object({
     name: z.string(),
     type: z.enum(['A - Services', 'A - Goods', 'B - Services']),
     // Optional VAT number; when present we treat as EU
-    vatNumber: z
-        .string()
-        .transform((s) => s?.toString?.() ?? '')
-        .optional(),
     grandTotal: z.number(),
     vatRate: z.number(),
     baseValue: z.number(),
     vatValue: z.number(),
+    vatNumber: z
+        .string()
+        .transform((s) => s?.toString?.() ?? '')
+        .optional(),
 });
 
 // Extend with derived flags so downstream filters keep working unchanged
