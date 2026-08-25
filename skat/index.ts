@@ -37,6 +37,8 @@ type InitialRecord = {
     llc_cost?: number | null;
     country?: string | null;
     euSaleReported?: unknown;
+    notes?: string | null;
+    vat_deduct_pct?: number | string | null;
 };
 
 const EU_COUNTRIES = new Set([
@@ -90,6 +92,17 @@ const recSchema = z.object({
         .transform((value) => value?.toString?.().trim().toUpperCase() ?? '')
         .optional(),
     euSaleReported: z.any().optional(),
+    notes: z
+        .any()
+        .transform((value) => value?.toString?.().trim() ?? '')
+        .optional(),
+    // A blank cell means full deduction. Preprocess before coercion, because
+    // z.coerce.number() would turn the empty string into 0 and silently wipe the deduction.
+    vat_deduct_pct: z.preprocess(
+        (value) =>
+            value === '' || value === null || value === undefined ? 100 : value,
+        z.coerce.number(),
+    ),
 });
 
 type Record = z.infer<typeof recSchema> & {
@@ -162,6 +175,18 @@ const filteredRecords = initialRecords
                     `Invalid vatRate ${p.vatRate} for invoice ${String(
                         p.invoiceId,
                     )}: DK transactions must have 0.25 VAT rate`,
+                );
+            }
+            // - Partial deduction is a percentage of the row's own VAT (momsloven §38 stk. 2)
+            if (
+                !Number.isFinite(p.vat_deduct_pct) ||
+                p.vat_deduct_pct < 0 ||
+                p.vat_deduct_pct > 100
+            ) {
+                throw new Error(
+                    `Invalid vat_deduct_pct ${p.vat_deduct_pct} for invoice ${String(
+                        p.invoiceId,
+                    )}: must be a number between 0 and 100 (blank means 100)`,
                 );
             }
             // - Ensure base + VAT equals grand total (within rounding tolerance)
@@ -292,6 +317,55 @@ if (pendingEuSales.length) {
     );
 }
 
+// Partial deduction is only implemented for Danish input VAT.
+// ponytail: ceiling is reverse charge - the same figure is both owed and deducted, so a partial
+// deduction there needs the reverse-charge buckets split into an owed side and a deductible side.
+// Until that exists, refuse rather than silently deduct 100%.
+const unsupportedPartialDeduction = vatRecords.filter(
+    (record: Record) =>
+        record.vat_deduct_pct < 100 &&
+        !(record.inDk && record.type.startsWith('A')),
+);
+if (unsupportedPartialDeduction.length) {
+    console.error(
+        `Partial deduction on reverse-charge rows is not supported and must be handled manually: ${unsupportedPartialDeduction
+            .map((record: Record) => `${record.invoiceId} (${record.name})`)
+            .join(', ')}`,
+    );
+    process.exit(1);
+}
+
+const partialDeductionRecords = vatRecords.filter(
+    (record: Record) => record.vat_deduct_pct < 100,
+);
+if (partialDeductionRecords.length) {
+    console.info(
+        `Partial deduction (momsloven §38 stk. 2) on ${partialDeductionRecords.length} row(s):`,
+    );
+    partialDeductionRecords.forEach((record: Record) => {
+        const deducted = (record.vatValue * record.vat_deduct_pct) / 100;
+        console.info(
+            `  ${record.invoiceId} ${record.date.toISOString().slice(0, 10)} ${
+                record.name
+            }${record.notes ? ` (${record.notes})` : ''}: vatValue ${record.vatValue.toFixed(
+                2,
+            )} x ${record.vat_deduct_pct}% = ${deducted.toFixed(
+                2,
+            )} deducted, ${(record.vatValue - deducted).toFixed(2)} given up`,
+        );
+    });
+    console.info(
+        `  Total given up: ${partialDeductionRecords
+            .reduce(
+                (acc: number, record: Record) =>
+                    acc +
+                    (record.vatValue * (100 - record.vat_deduct_pct)) / 100,
+                0,
+            )
+            .toFixed(2)} DKK`,
+    );
+}
+
 // Caclulate
 // https://skat.dk/en-us/businesses/vat/vat-on-international-trade/reporting-your-international-trade
 // https://skat.dk/erhverv/moms/moms-ved-handel-med-udlandet/indberet-din-handel-med-udlandet
@@ -333,7 +407,10 @@ const tax = {
 tax['vat-in-dk'] = vatRecords
     .filter((r: Record) => r.inDk)
     .filter((r: Record) => r.type.startsWith('A'))
-    .reduce((acc: number, r: Record) => acc + r.vatValue, 0);
+    .reduce(
+        (acc: number, r: Record) => acc + (r.vatValue * r.vat_deduct_pct) / 100,
+        0,
+    );
 
 // Moms af varekøb i udlandet (både EU og lande uden for EU)
 // VAT on goods purchased outside Denmark (both the EU and third countries).
@@ -474,7 +551,8 @@ tax['eu-sales-without-vat'] = vatRecords
 tax['vat-collected'] = vatRecords
     .filter((r: Record) => r.type.startsWith('B'))
     .filter((r: Record) => r.vatRate === 0.25)
-    .reduce((acc: number, r: Record) => acc + Math.abs(r.vatValue), 0);
+    .reduce((acc: number, r: Record) => acc + Math.abs(r.vatValue), 0) +
+    tax['manual-25-reverse-charge'];
 
 tax['eu-sales-without-vat'] &&
     console.log(
